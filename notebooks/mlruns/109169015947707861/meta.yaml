@@ -1,0 +1,6 @@
+artifact_location: file:///Users/william/Will%27s%20Daily%20Work/Final%20Project/Final_Project_503/notebooks/mlruns/109169015947707861
+creation_time: 1765923615142
+experiment_id: '109169015947707861'
+last_update_time: 1765923615142
+lifecycle_stage: active
+name: Churn_Prediction_Optuna_Tuning

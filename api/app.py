@@ -1,20 +1,27 @@
 # api/app.py
 """
-FastAPI service for housing price prediction.
-Loads the trained model and exposes a /predict endpoint.
+FastAPI service for Bank Customer Churn Prediction.
+Loads the trained Optuna-tuned model and exposes a /predict endpoint.
 """
 
-from pathlib import Path
-from typing import Any, Dict, List
-
+import os
 import joblib
 import pandas as pd
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+import sys
+import churning_pipeline
+
+sys.modules['housing_pipeline'] = churning_pipeline
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# Import shared pipeline components so unpickling works
-from housing_pipeline import (
-    ClusterSimilarity,
+# -----------------------------------------------------------------------------
+# 1. Import shared pipeline components
+# -----------------------------------------------------------------------------
+
+from churning_pipeline import (
     column_ratio,
     ratio_name,
     build_preprocessing,
@@ -22,91 +29,105 @@ from housing_pipeline import (
 )
 
 # -----------------------------------------------------------------------------
-# Configuration
+# 2. Configuration
 # -----------------------------------------------------------------------------
-MODEL_PATH = Path("/app/models/global_best_model_optuna.pkl")
+
+MODEL_PATH = Path("models/global_best_model_optuna.pkl")
 
 app = FastAPI(
-    title="Housing Price Prediction API",
-    description="FastAPI service for predicting California housing prices",
+    title="Bank Churn Prediction API",
+    description="FastAPI service for predicting customer churn probability",
     version="1.0.0",
 )
 
-
 # -----------------------------------------------------------------------------
-# Load model at startup
+# 3. Load model at startup
 # -----------------------------------------------------------------------------
 def load_model(path: Path):
     """Load the trained model from disk."""
     if not path.exists():
-        raise FileNotFoundError(f"Model file not found: {path}")
+        path = Path("../models/global_best_model_optuna.pkl")
+        if not path.exists():
+            raise FileNotFoundError(f"Model file not found at: {path}")
 
     print(f"Loading model from: {path}")
     m = joblib.load(path)
     print("✓ Model loaded successfully!")
     print(f"  Model type: {type(m).__name__}")
-    if hasattr(m, "named_steps"):
-        print(f"  Pipeline steps: {list(m.named_steps.keys())}")
     return m
 
+model = None
 
-try:
-    model = load_model(MODEL_PATH)
-except Exception as e:
-    print(f"✗ ERROR: Failed to load model from {MODEL_PATH}")
-    print(f"  Error: {e}")
-    raise RuntimeError(f"Failed to load model: {e}")
-
+@app.on_event("startup")
+async def startup_event():
+    global model
+    print("\n" + "=" * 80)
+    print("Churn Prediction API - Starting Up")
+    print("=" * 80)
+    try:
+        model = load_model(MODEL_PATH)
+        print("API is ready to accept requests!")
+    except Exception as e:
+        print(f"✗ ERROR: Failed to load model. {e}")
+    print("=" * 80 + "\n")
 
 # -----------------------------------------------------------------------------
-# Request / Response Schemas
+# 4. Request / Response Schemas (Data Models)
 # -----------------------------------------------------------------------------
+
+class CustomerInstance(BaseModel):
+    """
+    Define the input features for a single customer instance.
+    """
+    credit_score: int
+    geography: str
+    gender: str
+    age: int
+    tenure: int
+    balance: float
+    num_of_products: int
+    has_cr_card: int
+    is_active_member: int
+    estimated_salary: float
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "credit_score": 600,
+                "geography": "France",
+                "gender": "Male",
+                "age": 40,
+                "tenure": 3,
+                "balance": 60000.0,
+                "num_of_products": 2,
+                "has_cr_card": 1,
+                "is_active_member": 1,
+                "estimated_salary": 50000.0
+            }
+        }
+
 class PredictRequest(BaseModel):
     """
-    Prediction request with list of instances (dicts of features).
+    Schema for prediction request containing multiple customer instances.
     """
-    instances: List[Dict[str, Any]]
-
-    class Config:
-        schema_extra = {
-            "example": {
-                "instances": [
-                    {
-                        "longitude": -122.23,
-                        "latitude": 37.88,
-                        "housing_median_age": 41.0,
-                        "total_rooms": 880.0,
-                        "total_bedrooms": 129.0,
-                        "population": 322.0,
-                        "households": 126.0,
-                        "median_income": 8.3252,
-                        "ocean_proximity": "NEAR BAY",
-                    }
-                ]
-            }
-        }
-
+    instances: List[CustomerInstance]
 
 class PredictResponse(BaseModel):
-    predictions: List[float]
+    """
+    Return schema for prediction response.
+    """
+    predictions: List[int]          # 0 or 1
+    probabilities: List[float]      # churn probability (0.0 - 1.0)
+    churn_status: List[str]         # "Churn" or "Stay"
     count: int
 
-    class Config:
-        schema_extra = {
-            "example": {
-                "predictions": [452600.0],
-                "count": 1,
-            }
-        }
-
-
 # -----------------------------------------------------------------------------
-# Routes
+# 5. Routes
 # -----------------------------------------------------------------------------
 @app.get("/")
 def root():
     return {
-        "name": "Housing Price Prediction API",
+        "name": "Bank Churn Prediction API",
         "version": "1.0.0",
         "endpoints": {
             "health": "/health",
@@ -114,7 +135,6 @@ def root():
             "docs": "/docs",
         },
     }
-
 
 @app.get("/health")
 def health() -> Dict[str, str]:
@@ -124,9 +144,11 @@ def health() -> Dict[str, str]:
         "model_path": str(MODEL_PATH),
     }
 
-
 @app.post("/predict", response_model=PredictResponse)
 def predict(request: PredictRequest):
+    if not model:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
     if not request.instances:
         raise HTTPException(
             status_code=400,
@@ -134,23 +156,29 @@ def predict(request: PredictRequest):
         )
 
     try:
-        X = pd.DataFrame(request.instances)
+        # 1. transform input to DataFrame
+        data_list = [item.dict() for item in request.instances]
+        X = pd.DataFrame(data_list)
+        
+        # 2. dummy columns to satisfy pipeline requirements
+        X["row_number"] = 1
+        X["customer_id"] = 10000000
+        X["surname"] = "API_User"
+        X["exited"] = 0 # Dummy target
+        
+        # 3. lowercase columns for consistency
+        X.columns = X.columns.str.lower()
+
     except Exception as e:
         raise HTTPException(
             status_code=400,
             detail=f"Invalid input format. Could not convert to DataFrame: {e}",
         )
 
+    # 4. Check required columns
     required_columns = [
-        "longitude",
-        "latitude",
-        "housing_median_age",
-        "total_rooms",
-        "total_bedrooms",
-        "population",
-        "households",
-        "median_income",
-        "ocean_proximity",
+        "credit_score", "geography", "gender", "age", "tenure", 
+        "balance", "num_of_products", "has_cr_card", "is_active_member", "estimated_salary"
     ]
     missing = set(required_columns) - set(X.columns)
     if missing:
@@ -160,24 +188,33 @@ def predict(request: PredictRequest):
         )
 
     try:
-        preds = model.predict(X)
+        # 5. Make predictions
+        preds = model.predict(X) # 0 or 1
+        
+        # 6. Get probabilities
+        if hasattr(model, "predict_proba"):
+            probs = model.predict_proba(X)[:, 1]
+        else:
+            probs = [float(p) for p in preds]
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
             detail=f"Model prediction failed: {e}",
         )
 
-    preds_list = [float(p) for p in preds]
+    # 7. Output formatting
+    preds_list = [int(p) for p in preds]
+    probs_list = [float(p) for p in probs]
+    status_list = ["Churn (High Risk)" if p == 1 else "Stay (Low Risk)" for p in preds_list]
 
-    return PredictResponse(predictions=preds_list, count=len(preds_list))
+    return PredictResponse(
+        predictions=preds_list,
+        probabilities=probs_list,
+        churn_status=status_list,
+        count=len(preds_list)
+    )
 
-
-@app.on_event("startup")
-async def startup_event():
-    print("\n" + "=" * 80)
-    print("Housing Price Prediction API - Starting Up")
-    print("=" * 80)
-    print(f"Model path: {MODEL_PATH}")
-    print(f"Model loaded: {model is not None}")
-    print("API is ready to accept requests!")
-    print("=" * 80 + "\n")
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="127.0.0.1", port=8000, reload=True)

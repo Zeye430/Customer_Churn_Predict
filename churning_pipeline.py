@@ -1,10 +1,10 @@
-# housing_pipeline.py
+# churning_pipeline.py
 """
-Shared ML pipeline components for the housing project.
+Shared ML pipeline components for the churning project.
 
 This module holds all custom transformers and helper functions that are used
 both in training and in inference (FastAPI app), so that joblib pickles
-refer to a stable module path: `housing_pipeline.<name>`.
+refer to a stable module path: `churning_pipeline.<name>`.
 """
 
 import numpy as np
@@ -19,41 +19,17 @@ from sklearn.metrics.pairwise import rbf_kernel
 from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import RidgeClassifier
 
-from xgboost import XGBRegressor
-from lightgbm import LGBMRegressor
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
 
 
 # =============================================================================
-# Custom transformer and helper functions
+# Custom transformer
 # =============================================================================
-
-class ClusterSimilarity(BaseEstimator, TransformerMixin):
-    def __init__(self, n_clusters=10, gamma=1.0, random_state=None):
-        self.n_clusters = n_clusters
-        self.gamma = gamma
-        self.random_state = random_state
-
-    def fit(self, X, y=None, sample_weight=None):
-        self.kmeans_ = KMeans(
-            self.n_clusters,
-            n_init=10,
-            random_state=self.random_state
-        )
-        self.kmeans_.fit(X, sample_weight=sample_weight)
-        return self
-
-    def transform(self, X):
-        return rbf_kernel(X, self.kmeans_.cluster_centers_, gamma=self.gamma)
-
-    def fit_transform(self, X, y=None, sample_weight=None):
-        self.fit(X, y, sample_weight)
-        return self.transform(X)
-
-    def get_feature_names_out(self, names=None):
-        return [f"Cluster {i} similarity" for i in range(self.n_clusters)]
-
 
 def column_ratio(X):
     """
@@ -62,7 +38,7 @@ def column_ratio(X):
     """
     if isinstance(X, pd.DataFrame):
         X = X.values
-    return X[:, [0]] / X[:, [1]]
+    return X[:, [0]] / (X[:, [1]] + 1e-5)
 
 
 def ratio_name(function_transformer, feature_names_in):
@@ -83,15 +59,13 @@ def ratio_pipeline():
 
 log_pipeline = make_pipeline(
     SimpleImputer(strategy="median"),
-    FunctionTransformer(np.log, feature_names_out="one-to-one"),
+    FunctionTransformer(np.log1p, feature_names_out="one-to-one"), 
     StandardScaler(),
 )
 
-cluster_simil = ClusterSimilarity(n_clusters=10, gamma=1.0, random_state=42)
-
 cat_pipeline = make_pipeline(
     SimpleImputer(strategy="most_frequent"),
-    OneHotEncoder(handle_unknown="ignore"),
+    OneHotEncoder(handle_unknown="ignore", sparse_output=False),
 )
 
 default_num_pipeline = make_pipeline(
@@ -99,26 +73,29 @@ default_num_pipeline = make_pipeline(
     StandardScaler(),
 )
 
-
 def build_preprocessing():
     """
-    Return the ColumnTransformer preprocessing used in the housing models.
+    Define ColumnTransformer
     """
     preprocessing = ColumnTransformer(
         [
-            ("bedrooms",        ratio_pipeline(), ["total_bedrooms", "total_rooms"]),
-            ("rooms_per_house", ratio_pipeline(), ["total_rooms", "households"]),
-            ("people_per_house",ratio_pipeline(), ["population", "households"]),
-            ("log",             log_pipeline,
-                ["total_bedrooms", "total_rooms", "population",
-                 "households", "median_income"]),
-            ("geo",             cluster_simil, ["latitude", "longitude"]),
-            ("cat",             cat_pipeline, make_column_selector(dtype_include=object)),
+            # --- Feature Engineering ---
+            # 1. Create new feature: balance/salary ratio
+            ("bal_sal_ratio",   ratio_pipeline(), ["balance", "estimated_salary"]),
+            # 2. Create new feature: tenure/age ratio
+            ("tenure_age_ratio",ratio_pipeline(), ["tenure", "age"]),
+            
+            # --- Transformations ---
+            # 3. log pipline to long-tail distribution features
+            ("log",             log_pipeline,     ["age", "balance"]),
+            
+            # 4. One-Hot to categorical features
+            ("cat",             cat_pipeline,     make_column_selector(dtype_include=object)),
         ],
+        # 5. Other numerical features use default pipeline
         remainder=default_num_pipeline,
     )
     return preprocessing
-
 
 # =============================================================================
 # Estimator factory used by both non-Optuna and Optuna code
@@ -127,33 +104,39 @@ def build_preprocessing():
 def make_estimator_for_name(name: str):
     """
     Given a model name, return an unconfigured estimator instance.
-    Used in PCA variants and (optionally) elsewhere.
     """
     if name == "ridge":
-        return Ridge()
+        return RidgeClassifier(random_state=42)
+        
+    elif name == "logistic":
+        return LogisticRegression(random_state=42, solver='liblinear')
+    
+    elif name == "random_forest":
+        return RandomForestClassifier(random_state=42, n_jobs=-1)
+        
     elif name == "histgradientboosting":
-        return HistGradientBoostingRegressor(random_state=42)
+        return HistGradientBoostingClassifier(random_state=42)
+        
     elif name == "xgboost":
-        return XGBRegressor(
-            objective="reg:squarederror",
+        return XGBClassifier(
+            objective="binary:logistic",
+            eval_metric="logloss",
             random_state=42,
-            n_estimators=300,
+            n_estimators=100,
             learning_rate=0.1,
             max_depth=6,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            tree_method="hist",
             n_jobs=-1,
         )
+        
     elif name == "lightgbm":
-        return LGBMRegressor(
+        return LGBMClassifier(
+            objective="binary",
             random_state=42,
-            n_estimators=300,
+            n_estimators=100,
             learning_rate=0.05,
             num_leaves=31,
-            subsample=0.8,
-            colsample_bytree=0.8,
             n_jobs=-1,
+            verbose=-1,
         )
     else:
         raise ValueError(f"Unknown model name: {name}")
