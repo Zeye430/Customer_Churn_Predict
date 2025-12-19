@@ -39,5 +39,5 @@ services:
     restart: unless-stopped
 
 networks:
-  housing-network:
+  churning-network:
     driver: bridge
